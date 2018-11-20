@@ -1,6 +1,6 @@
-image: archlinux
+image: debian
 packages:
-    - go
+    - golang-go
 sources:
     - 'https://github.com/arborchat/muscadine/'
 environment:
