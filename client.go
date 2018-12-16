@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
+	"time"
 
 	arbor "github.com/arborchat/arbor-go"
 	"github.com/arborchat/muscadine/archive"
 	"github.com/arborchat/muscadine/types"
 )
+
+const timeout = 30 * time.Second
 
 // Connector is the type of function that connects to a server over
 // a given transport.
@@ -32,6 +36,9 @@ type NetClient struct {
 	receiveHandler    func(*arbor.ChatMessage)
 	stopSending       chan struct{}
 	stopReceiving     chan struct{}
+	// pingServer is used to request that we attempt to force a response from the server.
+	// This allows us to guard against a stale connection.
+	pingServer chan struct{}
 }
 
 // NewNetClient creates a NetClient configured to communicate with the server at the
@@ -54,6 +61,7 @@ func NewNetClient(address, username string, history *archive.Archive) (*NetClien
 		Composer:      Composer{username: username, sendChan: composerOut},
 		stopSending:   stopSending,
 		stopReceiving: stopReceiving,
+		pingServer:    make(chan struct{}),
 	}
 	return nc, nil
 }
@@ -108,6 +116,7 @@ func (nc *NetClient) Disconnect() error {
 	return err
 }
 
+// send reads messages from the Composer and sends them to the server.
 func (nc *NetClient) send() {
 	errored := false
 	for {
@@ -120,44 +129,114 @@ func (nc *NetClient) send() {
 			} else if errored {
 				continue
 			}
+		case <-nc.pingServer:
+			// query for the root message
+			root, _ := nc.Archive.Root()
+			go nc.Composer.Query(root)
 		case <-nc.stopSending:
 			return
 		}
 	}
 }
 
+// readChannel spawns its own goroutine to read from the NetClient's connection.
+// You can stop the goroutine by closing the channel that it returns.
+func (nc *NetClient) readChannel() chan struct {
+	*arbor.ProtocolMessage
+	error
+} {
+	out := make(chan struct {
+		*arbor.ProtocolMessage
+		error
+	})
+	// read messages continuously and send results back on a channel
+	go func() {
+		defer func() {
+			// ensure send on closed channel doesn't cause panic
+			if err := recover(); err != nil {
+				if _, ok := err.(runtime.Error); !ok {
+					// silently cancel runtime errors, but allow other errors
+					// to propagate.
+					panic(err)
+				}
+			}
+		}()
+		for {
+			m := new(arbor.ProtocolMessage)
+			err := nc.ReadWriteCloser.Read(m)
+			out <- struct {
+				*arbor.ProtocolMessage
+				error
+			}{m, err}
+		}
+	}()
+	return out
+}
+
+// handleMessage processes an Arbor ProtocolMessage. The actions
+// taken vary by the type of ProtocolMessage.
+func (nc *NetClient) handleMessage(m *arbor.ProtocolMessage) {
+	switch m.Type {
+	case arbor.NewMessageType:
+		if nc.receiveHandler != nil {
+			nc.receiveHandler(m.ChatMessage)
+			// ask notificationEngine to display the message
+			notificationEngine(nc, m.ChatMessage)
+		}
+	case arbor.WelcomeType:
+		if !nc.Has(m.Root) {
+			nc.Query(m.Root)
+		}
+		for _, recent := range m.Recent {
+			if !nc.Has(recent) {
+				nc.Query(recent)
+			}
+		}
+	}
+}
+
+// recieve monitors for new messages and for connection staleness.
+// If the connection with the server gets too stale, receive will close
+// it automatically.
 func (nc *NetClient) receive() {
 	errored := false
+	tick := time.NewTimer(timeout)
+	defer tick.Stop()
+	ticks := 0
+	out := nc.readChannel()
+	defer close(out)
 	for {
-		m := new(arbor.ProtocolMessage)
 		select {
 		case <-nc.stopReceiving:
 			return
-		default:
-			err := nc.ReadWriteCloser.Read(m)
+		case <-tick.C:
+			ticks++
+			if ticks == 1 {
+				// we haven't heard from the server in 30 seconds,
+				// try to interact.
+				nc.pingServer <- struct{}{}
+			} else if ticks > 1 {
+				// we haven't heard from the server in a minute,
+				// we're probably disconnected.
+				go nc.Disconnect()
+			}
+		case readMsg := <-out:
+			// reset our ticker to wait until 30 seconds from when we
+			// received this message.
+			tick.Reset(timeout)
+			ticks = 0
+
+			// check for errors
+			m := readMsg.ProtocolMessage
+			err := readMsg.error
 			if !errored && err != nil {
 				errored = true
 				go nc.Disconnect()
 			} else if errored {
 				continue
 			}
-			switch m.Type {
-			case arbor.NewMessageType:
-				if nc.receiveHandler != nil {
-					nc.receiveHandler(m.ChatMessage)
-					// ask notificationEngine to display the message
-					notificationEngine(nc, m.ChatMessage)
-				}
-			case arbor.WelcomeType:
-				if !nc.Has(m.Root) {
-					nc.Query(m.Root)
-				}
-				for _, recent := range m.Recent {
-					if !nc.Has(recent) {
-						nc.Query(recent)
-					}
-				}
-			}
+			// process the message
+			nc.handleMessage(m)
 		}
 	}
 }
